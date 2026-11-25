@@ -16,6 +16,8 @@
 
 package org.springframework.util;
 
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Locale;
@@ -437,6 +439,57 @@ class StringUtilsTests {
 		assertThat(StringUtils.pathEquals("/dummy1/bin/tmp/../dummy2/dummy3", "/dummy1/dummy2/dummy3")).as("Must be false for one false path on 1").isFalse();
 		assertThat(StringUtils.pathEquals("C:\\dummy1\\dummy2\\dummy3", "C:\\dummy1\\bin\\tmp\\..\\dummy2\\dummy3")).as("Must be false for one false win top path on 2").isFalse();
 		assertThat(StringUtils.pathEquals("/dummy1/bin/../dummy2/dummy3", "/dummy1/dummy2/dummy4")).as("Must be false for top path on 1 + difference").isFalse();
+	}
+
+	@Test
+	void uriDecode() {
+		Charset charset = StandardCharsets.UTF_8;
+		assertThat(StringUtils.uriDecode("", charset)).isEmpty();
+		assertThat(StringUtils.uriDecode("foobar", charset)).isEqualTo("foobar");
+		assertThat(StringUtils.uriDecode("foo%20bar", charset)).isEqualTo("foo bar");
+		assertThat(StringUtils.uriDecode("foo%2bbar", charset)).isEqualTo("foo+bar");
+		assertThat(StringUtils.uriDecode("foo+bar", charset)).isEqualTo("foo+bar");
+		assertThat(StringUtils.uriDecode("a%20b%20c", charset)).isEqualTo("a b c");
+		assertThat(StringUtils.uriDecode("T%C5%8Dky%C5%8D", charset)).isEqualTo("Tōkyō");
+		assertThat(StringUtils.uriDecode("/Z%C3%BCrich", charset)).isEqualTo("/Zürich");
+		assertThat(StringUtils.uriDecode("Tōkyō", charset)).isEqualTo("Tōkyō");
+		assertThat(StringUtils.uriDecode("%C5%8D%20%C5%8D", charset)).isEqualTo("ō ō");
+		assertThat(StringUtils.uriDecode("%20’", charset)).isEqualTo(" ’");
+		assertThat(StringUtils.uriDecode("śpřìńġ", charset)).isEqualTo("śpřìńġ");
+		assertThat(StringUtils.uriDecode("%20śpřìńġ", charset)).isEqualTo(" śpřìńġ");
+		assertThat(StringUtils.uriDecode("foo%20bar", StandardCharsets.ISO_8859_1)).isEqualTo("foo bar");
+		assertThat(StringUtils.uriDecode("Z%FCrich", StandardCharsets.ISO_8859_1)).isEqualTo("Zürich");
+	}
+
+	@Test  // CVE-2025-41242
+	void uriDecodeDoesNotTruncateNonLatinCharactersToDotSegments() {
+		Charset charset = StandardCharsets.UTF_8;
+		// U+012E (LATIN CAPITAL LETTER I WITH OGONEK) has 0x2E ('.') as its low byte
+		assertThat(StringUtils.uriDecode("Į%2e/", charset)).isEqualTo("Į./");
+		assertThat(StringUtils.uriDecode("ĮĮ%2F", charset)).isEqualTo("ĮĮ/");
+		String traversal = "/static/ĮĮ/ĮĮ/etc/passw%64";
+		assertThat(StringUtils.uriDecode(traversal, charset))
+				.isEqualTo("/static/ĮĮ/ĮĮ/etc/passwd")
+				.doesNotContain("..");
+		// Low bytes of U+962E U+4E25 U+7075 U+4E30 U+4E30 U+7532 U+6765 spell ".%u002e"
+		String segment = "阮严灵丰丰甲来";
+		String payload = "/" + segment + "/" + segment + "/etc/passw%64";
+		assertThat(StringUtils.uriDecode(payload, charset))
+				.isEqualTo("/" + segment + "/" + segment + "/etc/passwd")
+				.doesNotContain(".")
+				.doesNotContain("%");
+	}
+
+	@Test
+	void uriDecodeInvalidSequence() {
+		Charset charset = StandardCharsets.UTF_8;
+		assertThatIllegalArgumentException().isThrownBy(() -> StringUtils.uriDecode("foo%2", charset));
+		assertThatIllegalArgumentException().isThrownBy(() -> StringUtils.uriDecode("foo%", charset));
+		assertThatIllegalArgumentException().isThrownBy(() -> StringUtils.uriDecode("%", charset));
+		assertThatIllegalArgumentException().isThrownBy(() -> StringUtils.uriDecode("%zz", charset));
+		assertThatIllegalArgumentException().isThrownBy(() -> StringUtils.uriDecode("%2g", charset));
+		assertThatIllegalArgumentException().isThrownBy(() -> StringUtils.uriDecode("%20%2", charset));
+		assertThatIllegalArgumentException().isThrownBy(() -> StringUtils.uriDecode("Į%", charset));
 	}
 
 	@Test
