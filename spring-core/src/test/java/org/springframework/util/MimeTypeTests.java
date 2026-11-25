@@ -98,13 +98,50 @@ class MimeTypeTests {
 	}
 
 	@Test
-	void parseQuotedSeparator() {
+	void parseQuotedParameterValue() {
 		String s = "application/xop+xml;charset=utf-8;type=\"application/soap+xml;action=\\\"https://x.y.z\\\"\"";
 		MimeType mimeType = MimeType.valueOf(s);
 		assertThat(mimeType.getType()).as("Invalid type").isEqualTo("application");
 		assertThat(mimeType.getSubtype()).as("Invalid subtype").isEqualTo("xop+xml");
 		assertThat(mimeType.getCharset()).as("Invalid charset").isEqualTo(StandardCharsets.UTF_8);
 		assertThat(mimeType.getParameter("type")).isEqualTo("\"application/soap+xml;action=\\\"https://x.y.z\\\"\"");
+	}
+
+	@Test  //  gh-36730
+	void parseParameterWithQuotedPair() {
+		String s = "text/plain;twelve=\"1\\\"2\"";
+		MimeType mimeType = MimeType.valueOf(s);
+		assertThat(mimeType.getType()).as("Invalid type").isEqualTo("text");
+		assertThat(mimeType.getSubtype()).as("Invalid subtype").isEqualTo("plain");
+		assertThat(mimeType.getParameter("twelve")).isEqualTo("\"1\\\"2\"");
+	}
+
+	@Test
+	void parseParameterWithQuotedPairDoesNotSplitQuotedString() {
+		// an escaped quote must not terminate the quoted-string, otherwise the
+		// "boundary" parameter hidden in it overrides the real one
+		String s = "multipart/form-data;boundary=real;x=\"\\\";boundary=evil;\\\"\"";
+		MimeType mimeType = MimeType.valueOf(s);
+		assertThat(mimeType.getType()).as("Invalid type").isEqualTo("multipart");
+		assertThat(mimeType.getSubtype()).as("Invalid subtype").isEqualTo("form-data");
+		assertThat(mimeType.getParameters()).hasSize(2);
+		assertThat(mimeType.getParameter("boundary")).isEqualTo("real");
+		assertThat(mimeType.getParameter("x")).isEqualTo("\"\\\";boundary=evil;\\\"\"");
+	}
+
+	@Test
+	void parseParameterWithEscapedBackslashBeforeClosingQuote() {
+		String s = "multipart/form-data;x=\"a\\\\\";boundary=real";
+		MimeType mimeType = MimeType.valueOf(s);
+		assertThat(mimeType.getParameters()).hasSize(2);
+		assertThat(mimeType.getParameter("x")).isEqualTo("\"a\\\\\"");
+		assertThat(mimeType.getParameter("boundary")).isEqualTo("real");
+	}
+
+	@Test
+	void parseParameterWithTrailingBackslashInQuotedString() {
+		assertThatExceptionOfType(InvalidMimeTypeException.class).isThrownBy(() ->
+				MimeTypeUtils.parseMimeType("text/plain;a=\"b\\"));
 	}
 
 	@Test
@@ -284,6 +321,13 @@ class MimeTypeTests {
 	void parseMimeTypeIllegalQuotedParameterValue() {
 		assertThatExceptionOfType(InvalidMimeTypeException.class).isThrownBy(() ->
 				MimeTypeUtils.parseMimeType("audio/*;attr=\""));
+	}
+
+	@Test  // gh-36971
+	void parseMimeTypeWrappedInQuotes() {
+		assertThatExceptionOfType(InvalidMimeTypeException.class)
+				.isThrownBy(() -> MimeTypeUtils.parseMimeType("\"application/xml\""))
+				.withMessageContaining("Invalid token character '\"'");
 	}
 
 	@Test
