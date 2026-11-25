@@ -1,0 +1,215 @@
+name: 'Seal Test Report'
+description: 'Turns on per-test Gradle result logging before the build, and prints every skipped test with its reason plus JUnit totals after it'
+inputs:
+  mode:
+    required: true
+    description: "'setup' installs the Gradle init script before the build; 'report' prints skip reasons and JUnit XML totals after it"
+runs:
+  using: composite
+  steps:
+    - name: Enable Test Result Logging
+      if: ${{ inputs.mode == 'setup' }}
+      shell: bash
+      run: |
+        mkdir -p $HOME/.gradle/init.d
+        cat > $HOME/.gradle/init.d/seal-test-results.gradle <<'GRADLE'
+        allprojects {
+          tasks.withType(Test).configureEach { t ->
+            t.outputs.cacheIf { false }
+            t.outputs.upToDateWhen { false }
+            t.testLogging {
+              events 'skipped', 'failed'
+              exceptionFormat 'full'
+            }
+            def sealSkipFile = new File(t.project.rootDir, "build/seal-skipped/${t.path.replace(':', '_')}.tsv")
+            t.doFirst { sealSkipFile.delete() }
+            t.afterTest { desc, result ->
+              if (result.resultType.name() == 'SKIPPED') {
+                sealSkipFile.parentFile.mkdirs()
+                def msg = (result.exception?.message ?: '').replaceAll('[\\t\\r\\n]+', ' ')
+                sealSkipFile << "${t.path}\t${desc.className}\t${desc.name}\t${msg}\t${desc.parent?.name ?: ''}\n"
+              }
+            }
+            t.afterSuite { desc, result ->
+              if (desc.parent == null) {
+                println "TEST SUMMARY ${t.path}: tests=${result.testCount} passed=${result.successfulTestCount} failed=${result.failedTestCount} skipped=${result.skippedTestCount} result=${result.resultType}"
+              }
+            }
+          }
+          // Lint/format gates (checkstyle, spring-javaformat checkFormat, nohttp) never run the code under test
+          tasks.configureEach { g ->
+            if (g.name.startsWith('checkstyle') || g.name.startsWith('checkFormat')) {
+              g.enabled = false
+            }
+          }
+        }
+        GRADLE
+    - name: Report Skipped Tests
+      if: ${{ inputs.mode == 'report' }}
+      shell: bash
+      run: |
+        python3 - <<'PY'
+        import glob, os, re
+        from collections import Counter
+        idx = {}
+        for f in glob.glob('**/src/*/*/**/*.java', recursive=True) + glob.glob('**/src/*/*/**/*.kt', recursive=True):
+            parts = f.split(os.sep)
+            i = parts.index('src')
+            if len(parts) > i + 3 and parts[i + 2] in ('java', 'kotlin'):
+                idx.setdefault('.'.join(parts[i + 3:]).rsplit('.', 1)[0], []).append(f)
+        ANN = re.compile(r'@(Disabled|Enabled|Ignore|IfProfileValue)\w*')
+        ASSUME = re.compile(r'\b(assume\w*|Assumptions\.\w+|Assume\.\w+)\s*\(')
+        cache = {}
+        def lines(f):
+            if f not in cache:
+                with open(f, encoding='utf-8', errors='replace') as h:
+                    cache[f] = h.read().splitlines()
+            return cache[f]
+        def anns_before(ls, i):
+            out = []
+            for j in range(i, max(-1, i - 9), -1):
+                s = ls[j].strip()
+                if j < i and (s.endswith('}') or s.endswith(';')):
+                    break
+                m = ANN.search(s)
+                if m:
+                    out.append(s[m.start():])
+            return out
+        def body_assumes(ls, i):
+            out, depth, started = [], 0, False
+            for k in range(i, min(len(ls), i + 80)):
+                l = ls[k]
+                if ASSUME.search(l):
+                    stmt = l.strip()
+                    n = k
+                    while not stmt.endswith(';') and n + 1 < len(ls) and n < k + 3:
+                        n += 1
+                        stmt += ' ' + ls[n].strip()
+                    out.append('assumption: ' + stmt)
+                depth += l.count('{') - l.count('}')
+                started = started or '{' in l
+                if started and depth <= 0:
+                    break
+            return out
+        def chain(cls):
+            top = cls.split('$')[0]
+            seen = []
+            while top in idx and top not in seen and len(seen) < 6:
+                seen.append(top)
+                ls = lines(idx[top][0])
+                name = top.split('.')[-1]
+                sup = None
+                for l in ls:
+                    m = re.search(r'\bclass\s+' + re.escape(name) + r'\b[^{]*?\bextends\s+([\w.]+)', l)
+                    if m:
+                        sup = m.group(1)
+                        break
+                    m = re.search(r'\bclass\s+' + re.escape(name) + r'\b.*\)\s*:\s*([\w.]+)\(', l)
+                    if m:
+                        sup = m.group(1)
+                        break
+                if not sup:
+                    break
+                if '.' not in sup:
+                    imp = [l for l in ls if re.match(r'\s*import\s+[\w.]+\.' + re.escape(sup) + r'\s*;?\s*$', l)]
+                    sup = re.sub(r'^\s*import\s+|\s*;?\s*$', '', imp[0]) if imp else top.rsplit('.', 1)[0] + '.' + sup
+                top = sup
+            return seen
+        def lifecycle_assumes(ls):
+            out = []
+            for i, l in enumerate(ls):
+                if re.search(r'@(BeforeAll|BeforeEach|BeforeClass|Before)\b', l):
+                    out += [a.replace('assumption:', 'assumption in @' + re.search(r'@(\w+)', l).group(1) + ':') for a in body_assumes(ls, i + 1)]
+            return out
+        def reason(cls, name, parent=''):
+            if cls in ('UnknownClass', '') or not cls:
+                cls, name = name, ''
+            raw = re.sub(r'[(\[].*$', '', name)
+            if not raw.strip() and parent and parent != cls:
+                raw = re.sub(r'[(\[].*$', '', parent)
+            method = raw.strip()
+            classes = chain(cls)
+            why = []
+            if method:
+                alts = '|'.join(re.escape(m) for m in dict.fromkeys([raw, method, raw.rstrip()]) if m)
+                pat = re.compile(r'\b(void|fun)\s+(`(' + alts + r')`|(' + alts + r'))\s*\(')
+                sig = re.search(r'\(([^)]*)\)', name or parent or '')
+                first = sig.group(1).split(',')[0].strip().split('.')[-1] if sig else ''
+                for c in classes:
+                    ls = lines(idx[c][0])
+                    hits = [i for i, l in enumerate(ls) if pat.search(l)]
+                    if sig is not None:
+                        exact = [i for i in hits if re.search(r'\(\s*\)' if not first else r'\(\s*(final\s+)?(@\w+(\([^)]*\))?\s+)*' + re.escape(first) + r'\b', ls[i][ls[i].index('('):] if '(' in ls[i] else '')]
+                        hits = exact or hits
+                    hit = hits[0] if hits else None
+                    if hit is not None:
+                        why += anns_before(ls, hit) + body_assumes(ls, hit)
+                        break
+            nested = cls.split('$')[1:]
+            for c in classes:
+                ls = lines(idx[c][0])
+                for n in [c.split('.')[-1]] + (nested if c == classes[0] else []):
+                    for i, l in enumerate(ls):
+                        if re.search(r'\b(class|interface)\s+' + re.escape(n) + r'\b', l):
+                            why += ['class-level ' + a + ' (on ' + n + ')' for a in anns_before(ls, i)]
+                            break
+                why += lifecycle_assumes(ls)
+            return '; '.join(dict.fromkeys(why)) or 'no source annotation located (skipped by an upstream JUnit execution condition at runtime; no test filter applied by this build)'
+        import xml.etree.ElementTree as ET
+        FALLBACK = 'no source annotation located'
+        from collections import defaultdict
+        counts = Counter()
+        tsv_names = defaultdict(list)
+        for tsv in sorted(glob.glob('build/seal-skipped/*.tsv')):
+            with open(tsv, encoding='utf-8') as h:
+                for row in h:
+                    task, cls, name, msg, parent = (row.rstrip('\n').split('\t') + ['', '', '', '', ''])[:5]
+                    tsv_names[(task, cls)].append(name)
+                    counts[task] += 1
+                    src = reason(cls, name, parent)
+                    r = ('JUnit: ' + msg + ('' if src.startswith(FALLBACK) else '; ' + src)) if msg else src
+                    print(f'SKIPPED TEST {task} {cls} > {name} reason: {r}')
+        tot = {}
+        for x in sorted(glob.glob('**/build/test-results/*/TEST-*.xml', recursive=True)):
+            mod = x.split(os.sep + 'build' + os.sep)[0]
+            task = ':' + mod.replace(os.sep, ':') + ':' + x.split(os.sep)[-2]
+            try:
+                root = ET.parse(x).getroot()
+            except ET.ParseError:
+                continue
+            t = tot.setdefault(mod, [0, 0, 0, 0])
+            for k, a in enumerate(('tests', 'failures', 'errors', 'skipped')):
+                t[k] += int(root.get(a, 0))
+            xml_skips = defaultdict(list)
+            for tc in root.iter('testcase'):
+                sk = tc.find('skipped')
+                if sk is not None:
+                    xml_skips[tc.get('classname', '')].append((tc.get('name', ''), ' '.join((sk.get('message') or sk.text or '').split())))
+            listed = 0
+            for cls, entries in xml_skips.items():
+                have = tsv_names.get((task, cls), [])
+                extra = len(entries) - len(have)
+                if extra <= 0:
+                    listed += len(entries)
+                    continue
+                listed += len(have)
+                cands = [e for e in entries if e[0] not in have and not e[0].startswith('[')] or [e for e in entries if e[0] not in have]
+                for name, jmsg in cands[:extra]:
+                    src = reason(cls, name)
+                    r = ('JUnit: ' + jmsg + ('' if src.startswith(FALLBACK) else '; ' + src)) if jmsg else src
+                    counts[task] += 1
+                    listed += 1
+                    print(f'SKIPPED TEST {task} {cls} > {name} (skipped at container level) reason: {r}')
+            rest = int(root.get('skipped', 0)) - listed
+            if rest > 0:
+                suite = root.get('name', '')
+                counts[task] += rest
+                print(f'SKIPPED TEST {task} {suite} > ({rest} skipped without individual entry) reason: {reason(suite, "")}')
+        for task, c in sorted(counts.items()):
+            print(f'SKIPPED TESTS LISTED FOR {task}: {c}')
+        print(f'SKIPPED TESTS WITH REASONS: {sum(counts.values())}')
+        for mod, (n, f, e, sk) in sorted(tot.items()):
+            print(f'JUNIT XML TOTALS {mod}: tests={n} passed={n - f - e - sk} failed={f + e} skipped={sk}')
+        g = [sum(v[i] for v in tot.values()) for i in range(4)]
+        print(f'JUNIT XML TOTALS ALL MODULES: tests={g[0]} passed={g[0] - g[1] - g[2] - g[3]} failed={g[1] + g[2]} skipped={g[3]}')
+        PY

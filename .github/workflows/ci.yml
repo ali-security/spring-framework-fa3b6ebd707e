@@ -1,13 +1,16 @@
 name: CI
 on:
-  push:
-    branches:
-      - 6.1.x
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle test task selector; empty runs the full suite'
+        required: false
+        default: ''
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
 jobs:
   ci:
-    if: ${{ github.repository == 'spring-projects/spring-framework' }}
+    timeout-minutes: 50
     strategy:
       matrix:
         os:
@@ -26,13 +29,6 @@ jobs:
     name: '${{ matrix.os.name}} | Java ${{ matrix.java.version}}'
     runs-on: ${{ matrix.os.id }}
     steps:
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'liberica'
-          java-version: |
-            ${{ matrix.java.version }}
-            ${{ matrix.java.toolchain && '17' || '' }}
       - name: Prepare Windows runner
         if: ${{ runner.os == 'Windows' }}
         run: |
@@ -41,6 +37,14 @@ jobs:
           Stop-Service -name Docker
       - name: Check out code
         uses: actions/checkout@v4
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'liberica'
+          java-version: |
+            ${{ matrix.java.version }}
+            ${{ matrix.java.toolchain && '17' || '' }}
+          cache: gradle
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@417ae3ccd767c252f5661f1ace9f835f9654f2b5
         with:
@@ -61,6 +65,10 @@ jobs:
           echo systemProp.org.gradle.java.installations.auto-detect=false >> $HOME/.gradle/gradle.properties
           echo systemProp.org.gradle.java.installations.auto-download=false >> $HOME/.gradle/gradle.properties
           echo systemProp.org.gradle.java.installations.paths=${{ format('$JAVA_HOME_{0}_X64', matrix.java.version) }} >> $HOME/.gradle/gradle.properties
+      - name: Enable Test Result Logging
+        uses: ./.github/actions/seal-test-report
+        with:
+          mode: setup
       - name: Build
         id: build
         env:
@@ -69,12 +77,14 @@ jobs:
           GRADLE_ENTERPRISE_ACCESS_KEY: ${{ secrets.GRADLE_ENTERPRISE_SECRET_ACCESS_KEY }}
           GRADLE_ENTERPRISE_CACHE_USERNAME: ${{ secrets.GRADLE_ENTERPRISE_CACHE_USER }}
           GRADLE_ENTERPRISE_CACHE_PASSWORD: ${{ secrets.GRADLE_ENTERPRISE_CACHE_PASSWORD }}
-        run: ./gradlew check antora
-      - name: Send notification
-        uses: ./.github/actions/send-notification
-        if: always()
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew assemble ${{ inputs.test-filter }}
+          else
+            ./gradlew check
+          fi
+      - name: Report Skipped Tests
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/seal-test-report
         with:
-          webhook-url: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
-          status: ${{ job.status }}
-          build-scan-url: ${{ steps.build.outputs.build-scan-url }}
-          run-name: ${{ format('{0} | {1} | Java {2}', github.ref_name, matrix.os.name, matrix.java.version) }}
+          mode: report
