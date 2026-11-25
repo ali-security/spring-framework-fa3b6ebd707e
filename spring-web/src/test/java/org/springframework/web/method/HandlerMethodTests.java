@@ -38,28 +38,41 @@ import static org.assertj.core.api.Assertions.assertThat;
 class HandlerMethodTests {
 
 	@Test
-	void shouldValidateArgsWithConstraintsDirectlyOnClass() {
+	void shouldValidateArgsWithConstraintsDirectlyInClass() {
 		Object target = new MyClass();
 		testValidateArgs(target, List.of("addIntValue", "addPersonAndIntValue", "addPersons", "addNames"), true);
 		testValidateArgs(target, List.of("addPerson", "getPerson", "getIntValue", "addPersonNotValidated"), false);
 	}
 
 	@Test
-	void shouldValidateArgsWithConstraintsOnInterface() {
+	void shouldValidateArgsWithConstraintsInInterface() {
 		Object target = new MyInterfaceImpl();
 		testValidateArgs(target, List.of("addIntValue", "addPersonAndIntValue", "addPersons"), true);
 		testValidateArgs(target, List.of("addPerson", "addPersonNotValidated", "getPerson", "getIntValue"), false);
 	}
 
 	@Test
-	void shouldValidateReturnValueWithConstraintsDirectlyOnClass() {
+	void shouldValidateArgsWithConstraintsInGenericAbstractSuperclass() {
+		Object target = new GenericInterfaceImpl();
+		shouldValidateArguments(getHandlerMethod(target, "processTwo", String.class), true);
+	}
+
+	@Test
+	void shouldValidateArgsWithConstraintsInGenericInterface() {
+		Object target = new GenericInterfaceImpl();
+		shouldValidateArguments(getHandlerMethod(target, "processOne", Long.class), false);
+		shouldValidateArguments(getHandlerMethod(target, "processOneAndTwo", Long.class, Object.class), true);
+	}
+
+	@Test
+	void shouldValidateReturnValueWithConstraintsDirectlyInClass() {
 		Object target = new MyClass();
 		testValidateReturnValue(target, List.of("getPerson", "getIntValue"), true);
 		testValidateReturnValue(target, List.of("addPerson", "addIntValue", "addPersonNotValidated"), false);
 	}
 
 	@Test
-	void shouldValidateReturnValueWithConstraintsOnInterface() {
+	void shouldValidateReturnValueWithConstraintsInInterface() {
 		Object target = new MyInterfaceImpl();
 		testValidateReturnValue(target, List.of("getPerson", "getIntValue"), true);
 		testValidateReturnValue(target, List.of("addPerson", "addIntValue", "addPersonNotValidated"), false);
@@ -72,9 +85,18 @@ class HandlerMethodTests {
 		testValidateReturnValue(target, List.of("getPerson"), false);
 	}
 
+	private static void shouldValidateArguments(HandlerMethod handlerMethod, boolean expected) {
+		if (expected) {
+			assertThat(handlerMethod.shouldValidateArguments()).as(handlerMethod.getMethod().getName()).isTrue();
+		}
+		else {
+			assertThat(handlerMethod.shouldValidateArguments()).as(handlerMethod.getMethod().getName()).isFalse();
+		}
+	}
+
 	private static void testValidateArgs(Object target, List<String> methodNames, boolean expected) {
 		for (String methodName : methodNames) {
-			assertThat(getHandlerMethod(target, methodName).shouldValidateArguments()).isEqualTo(expected);
+			shouldValidateArguments(getHandlerMethod(target, methodName), expected);
 		}
 	}
 
@@ -85,7 +107,11 @@ class HandlerMethodTests {
 	}
 
 	private static HandlerMethod getHandlerMethod(Object target, String methodName) {
-		Method method = ClassUtils.getMethod(target.getClass(), methodName, (Class<?>[]) null);
+		return getHandlerMethod(target, methodName, (Class<?>[]) null);
+	}
+
+	private static HandlerMethod getHandlerMethod(Object target, String methodName, Class<?>... parameterTypes) {
+		Method method = ClassUtils.getMethod(target.getClass(), methodName, parameterTypes);
 		return new HandlerMethod(target, method).createWithValidateFlags();
 	}
 
@@ -199,6 +225,33 @@ class HandlerMethodTests {
 		@Valid
 		public Person getPerson() {
 			throw new UnsupportedOperationException();
+		}
+	}
+
+	interface GenericInterface<A, B> {
+
+		void processOne(@Valid A value1);
+
+		void processOneAndTwo(A value1, @Max(42) B value2);
+	}
+
+	abstract static class GenericAbstractSuperclass<C> implements GenericInterface<Long, C> {
+
+		@Override
+		public void processOne(Long value1) {
+		}
+
+		@Override
+		public void processOneAndTwo(Long value1, C value2) {
+		}
+
+		public abstract void processTwo(@Max(42) C value);
+	}
+
+	static class GenericInterfaceImpl extends GenericAbstractSuperclass<String> {
+
+		@Override
+		public void processTwo(String value) {
 		}
 	}
 
